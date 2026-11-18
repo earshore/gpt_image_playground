@@ -1,24 +1,28 @@
 import { useEffect, useState, useMemo, useRef } from 'react'
-import { useStore, reuseConfig, editOutputs, removeTask, showCodexCliPrompt, getCodexCliPromptKey, retryTask } from '../store'
+import { useStore, reuseConfig, editOutputs, removeTask, removeTaskOutput, showCodexCliPrompt, getCodexCliPromptKey, retryTask } from '../store'
 import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { usePreventBackgroundScroll } from '../hooks/usePreventBackgroundScroll'
 import { useTooltip } from '../hooks/useTooltip'
-import { ensureImageCached, getCachedImage } from '../lib/imageCache'
+import { ensureImageCached, ensureImageDimensionsCached, getCachedImage } from '../lib/imageCache'
 import { formatImageRatio } from '../lib/size'
+import { getImageActualParams } from '../lib/imageActualParams'
 import { ActualValueBadge, DetailParamValue } from '../lib/paramDisplay'
 import { copyImageSourceToClipboard, copyTextToClipboard, getClipboardFailureMessage } from '../lib/clipboard'
 import { createMaskPreviewDataUrl } from '../lib/canvasImage'
 import { dismissAllTooltips } from '../lib/tooltipDismiss'
 import { downloadImageEntriesAsZip, downloadImageIds, getDownloadErrorMessage, getImageZipEntries, withSaveLocation } from '../lib/downloadImages'
 import { isAgentTaskPromptPending } from '../lib/taskPromptDisplay'
+import { getTaskOutputSlots } from '../lib/taskState'
 import { getImageComments, getTaskPromptText, replaceImageMentionsForApi } from '../lib/promptImageMentions'
 import { getApiProviderLabel } from '../lib/apiProfiles'
+import { getImageModelFamily, supportsGrokQuality } from '../lib/imageModels'
 import { isTauri } from '../lib/platform'
 import { CloseIcon, CodeIcon, CopyIcon, DownloadIcon, EditIcon, LinkIcon, TrashIcon } from './icons'
 
 import ViewportTooltip from './ViewportTooltip'
 import { CommentBadge } from './CommentMarks'
 import MarkupOverlay from './input/markupOverlay'
+import ImageSearchSources from './ImageSearchSources'
 
 export default function DetailModal() {
   const tasks = useStore((s) => s.tasks)
@@ -58,8 +62,11 @@ export default function DetailModal() {
   const retryTooltip = useTooltip()
   const retriedAtTooltip = useTooltip()
   const downloadImageTooltip = useTooltip()
+  const deleteOutputTooltip = useTooltip()
   const downloadOriginalImageTooltip = useTooltip()
   const downloadAllTooltip = useTooltip()
+  const copyTaskIdTooltip = useTooltip()
+  const copyImageIdTooltip = useTooltip()
 
   const clearTextSelection = () => {
     const selection = window.getSelection()
@@ -93,15 +100,6 @@ export default function DetailModal() {
   useEffect(() => {
     setStreamPreviewLoaded(false)
   }, [activeStreamPreviewSrc, detailTaskId, imageIndex])
-
-  useEffect(() => {
-    const count = task?.status === 'running'
-      ? streamPreviewItems.length
-      : task
-      ? (task.outputErrors?.length ? Math.max(task.params.n, task.outputImages.length + task.outputErrors.length) : task.outputImages.length)
-      : 0
-    if (count > 0 && imageIndex >= count) setImageIndex(count - 1)
-  }, [imageIndex, streamPreviewItems.length, task, task?.status])
 
   useCloseOnEscape(Boolean(task), () => setDetailTaskId(null))
   usePreventBackgroundScroll(Boolean(task), [modalRef, rawUrlsModalRef, rawResponseModalRef])
@@ -155,36 +153,29 @@ export default function DetailModal() {
   const maskTargetSrc = maskTargetId ? imageSrcs[maskTargetId] || '' : ''
   const maskSrc = task?.maskImageId ? imageSrcs[task.maskImageId] || '' : ''
   const allInputImageIds = task?.inputImageIds ?? []
-  const outputSlots = useMemo(() => {
-    if (!task) return []
-    const outputErrors = task.outputErrors ?? []
-    if (outputErrors.length === 0) {
-      return task.outputImages.map((imageId, outputImageIndex) => ({
-        requestIndex: outputImageIndex,
-        outputImageIndex,
-        imageId,
-        error: '',
-      }))
-    }
-
-    const errorsByIndex = new Map(outputErrors.map((item) => [item.requestIndex, item.error]))
-    const requestedCount = Math.max(task.params.n, task.outputImages.length + outputErrors.length)
-    let outputImageIndex = 0
-    return Array.from({ length: requestedCount }, (_, requestIndex) => {
-      const error = errorsByIndex.get(requestIndex)
-      if (error) return { requestIndex, outputImageIndex: -1, imageId: '', error }
-      const imageId = task.outputImages[outputImageIndex] ?? ''
-      const slot = { requestIndex, outputImageIndex, imageId, error: '' }
-      outputImageIndex += 1
-      return slot
-    })
-  }, [task])
+  const inputMarkupIds: Record<string, string | undefined> = task?.markupImageId && allInputImageIds.length ? { [allInputImageIds[0]]: task.markupImageId } : {}
+  const outputSlots = useMemo(() => task ? getTaskOutputSlots(task) : [], [task])
+  useEffect(() => {
+    const count = task?.status === 'running' ? streamPreviewItems.length : outputSlots.length
+    if (count > 0 && imageIndex >= count) setImageIndex(count - 1)
+  }, [imageIndex, streamPreviewItems.length, outputSlots.length, task?.status])
   const currentOutputSlot = outputSlots[imageIndex]
   const currentOutputImageId = currentOutputSlot?.imageId || ''
   const currentOutputImageIndex = currentOutputSlot?.outputImageIndex ?? -1
   const currentOutputError = currentOutputSlot?.error || ''
   const currentOriginalOutputImageId = currentOutputImageIndex >= 0 ? task?.transparentOriginalImages?.[currentOutputImageIndex] || '' : ''
   const currentOutputPreviewSrc = currentOutputImageId ? outputPreviewSrcs[currentOutputImageId] || '' : ''
+
+  useEffect(() => {
+    if (!currentOutputImageId) return
+    let cancelled = false
+    ensureImageDimensionsCached(currentOutputImageId).then((size) => {
+      if (cancelled || !size) return
+      setImageRatios((prev) => ({ ...prev, [currentOutputImageId]: formatImageRatio(size.width, size.height) }))
+      setImageSizes((prev) => ({ ...prev, [currentOutputImageId]: `${size.width}×${size.height}` }))
+    })
+    return () => { cancelled = true }
+  }, [currentOutputImageId])
 
   useEffect(() => {
     const outputImageIds = task?.outputImages ?? []
@@ -247,17 +238,17 @@ export default function DetailModal() {
   const baseActualParams = currentOutputImageId
     ? task.actualParamsByImage?.[currentOutputImageId] ?? task.actualParams
     : task.actualParams
-  const currentActualParams = (baseActualParams?.size || !currentImageSize)
-    ? baseActualParams
-    : { ...(baseActualParams ?? {}), size: currentImageSize.replace('×', 'x') }
+  const currentActualParams = getImageActualParams(task, currentImageSize, baseActualParams)
   const currentRevisedPrompt = currentOutputImageId ? task.revisedPromptByImage?.[currentOutputImageId]?.trim() : ''
   // 将 @图N 等 mention 标记和透明背景追加提示词都按实际请求内容比较，
   // 避免仅由本地请求预处理导致的不一致被当作“API 改写”。
   const requestPrompt = task.transparentOutput && task.transparentPrompt
     ? task.transparentPrompt
     : task.prompt
-  const promptSentToApi = replaceImageMentionsForApi(requestPrompt, task.inputImageIds.length).trim()
-  const showRevisedPrompt = Boolean(currentRevisedPrompt && currentRevisedPrompt !== promptSentToApi)
+  const originalPrompt = replaceImageMentionsForApi(requestPrompt, task.inputImageIds.length).trim()
+  const promptSentToApi = [task.promptHints?.prefix, originalPrompt, task.promptHints?.suffix].filter(Boolean).join('\n').trim()
+  const displayedPrompt = [task.promptHints?.prefix, getTaskPromptText(task.prompt, task.inputImageIds.length), task.promptHints?.suffix].filter(Boolean).join('\n')
+  const showRevisedPrompt = Boolean(currentRevisedPrompt && currentRevisedPrompt !== originalPrompt && currentRevisedPrompt !== promptSentToApi)
   const codexCliPromptKey = getCodexCliPromptKey(settings)
   const hasHandledPromptWarning = settings.codexCli || dismissedCodexCliPrompts.includes(codexCliPromptKey)
   const taskProvider = task.apiProvider
@@ -275,8 +266,12 @@ export default function DetailModal() {
   const streamPartialImageIds = task.streamPartialImageIds ?? []
   const supportsTransparentOutput = task.params.output_format !== 'jpeg'
   const transparentOutputText = task.transparentOutput || task.params.transparent_output ? 'true' : 'false'
+  const backgroundText = task.params.background === 'transparent' ? '透明' : task.params.background === 'opaque' ? '不透明' : '自动'
   const currentTransparentOutputFailed = Boolean(currentOutputImageId && task.transparentOutput && task.transparentOriginalImages?.[currentOutputImageIndex] === '')
   const outputCompressionText = task.params.output_compression == null ? '未设置' : String(task.params.output_compression)
+  const modelFamily = getImageModelFamily({ provider: taskProvider ?? 'openai', apiMode: task.apiMode ?? 'images', model: task.apiModel ?? '' })
+  const showQualityCard = !modelFamily || (modelFamily === 'grok' && supportsGrokQuality(task.apiModel ?? ''))
+  const showModerationCard = !modelFamily && task.apiProvider !== 'fal'
 
   const formatTime = (ts: number | null) => {
     if (!ts) return ''
@@ -333,7 +328,7 @@ export default function DetailModal() {
   const handleCopyPrompt = async () => {
     if (!task.prompt) return
     try {
-      await copyTextToClipboard(getTaskPromptText(task.prompt, task.inputImageIds.length))
+      await copyTextToClipboard(displayedPrompt)
       showToast('提示词已复制', 'success')
     } catch (err) {
       showToast(getClipboardFailureMessage('复制提示词失败', err), 'error')
@@ -470,8 +465,33 @@ export default function DetailModal() {
 
         {/* 左侧：图片 */}
         <div className="md:w-1/2 w-full h-64 md:h-auto bg-gray-100 dark:bg-black/20 relative flex items-center justify-center flex-shrink-0 min-h-[16rem]">
-          {task.status === 'done' && outputLen > 0 && (currentOutputImageId || task.outputImages.length > 0) && (
+          {task.status === 'done' && outputLen > 0 && (
             <div className="absolute right-3 top-[15px] z-20 flex items-center gap-1.5">
+              {currentOutputSlot && outputLen > 1 && (
+                <div className="relative group flex">
+                  <button
+                    type="button"
+                    {...deleteOutputTooltip.handlers}
+                    onClick={() => {
+                      deleteOutputTooltip.handlers.onClick()
+                      setConfirmDialog({
+                        title: '删除结果',
+                        message: '确定要删除这个结果吗？',
+                        awaitAction: true,
+                        busyText: '删除中…',
+                        action: () => removeTaskOutput(task.id, currentOutputSlot),
+                      })
+                    }}
+                    className="flex items-center justify-center px-1.5 py-0.5 bg-black/50 text-white rounded backdrop-blur-sm hover:bg-black/70 hover:text-red-400 transition-colors focus:outline-none focus:ring-1 focus:ring-white/50"
+                    aria-label="删除结果"
+                  >
+                    <TrashIcon className="h-4 w-4" />
+                  </button>
+                  <ViewportTooltip visible={deleteOutputTooltip.visible} className="whitespace-nowrap">
+                    删除结果
+                  </ViewportTooltip>
+                </div>
+              )}
               {currentOutputImageId && (
                 <div className="relative group flex">
                   <button
@@ -519,19 +539,6 @@ export default function DetailModal() {
                 src={currentOutputPreviewSrc}
                 data-image-id={currentOutputImageId}
                 className="saveable-image max-w-[calc(100%-2rem)] max-h-[calc(100%-2rem)] object-contain cursor-pointer"
-                onLoad={(e) => {
-                  const image = e.currentTarget
-                  if (currentOutputImageId && image.naturalWidth > 0 && image.naturalHeight > 0) {
-                    setImageRatios((prev) => ({
-                      ...prev,
-                      [currentOutputImageId]: formatImageRatio(image.naturalWidth, image.naturalHeight),
-                    }))
-                    setImageSizes((prev) => ({
-                      ...prev,
-                      [currentOutputImageId]: `${image.naturalWidth}×${image.naturalHeight}`,
-                    }))
-                  }
-                }}
                 onClick={() =>
                   setLightboxImageId(currentOutputImageId, task.outputImages)
                 }
@@ -893,7 +900,7 @@ export default function DetailModal() {
               </div>
             ) : (
               <p className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed whitespace-pre-wrap mb-4">
-                {getTaskPromptText(task.prompt, task.inputImageIds.length) || '(无提示词)'}
+                {displayedPrompt || '(无提示词)'}
               </p>
             )}
             {showRevisedPrompt && currentRevisedPrompt && (
@@ -926,7 +933,7 @@ export default function DetailModal() {
                   <div className="flex gap-2 flex-wrap">
                     {allInputImageIds.map((imgId, idx) => {
                       const isMaskTarget = imgId === maskTargetId
-                      const markupImageId = idx === 0 ? task.markupImageId : null
+                      const markupImageId = inputMarkupIds[imgId]
                       const commentCount = getImageComments(task.prompt, idx).length
                       const displaySrc = (isMaskTarget && maskPreviewSrc) ? maskPreviewSrc : (imageSrcs[imgId] || '')
                       return (
@@ -935,7 +942,7 @@ export default function DetailModal() {
                             className={`relative w-16 h-16 rounded-lg overflow-hidden border cursor-pointer hover:opacity-80 transition ${
                               isMaskTarget || commentCount > 0 || markupImageId ? 'border-blue-500 border-2 shadow-sm' : 'border-gray-200 dark:border-white/[0.08]'
                             }`}
-                            onClick={() => setLightboxImageId(imgId, allInputImageIds, task.prompt, { [allInputImageIds[0]]: task.markupImageId ?? undefined })}
+                            onClick={() => setLightboxImageId(imgId, allInputImageIds, task.prompt, inputMarkupIds, { type: 'history', maskTargetImageId: maskTargetId, maskImageId: task.maskImageId })}
                           >
                             {displaySrc && (
                               <img
@@ -981,21 +988,61 @@ export default function DetailModal() {
               </div>
             )}
             <div className="grid grid-cols-2 gap-2 text-xs mb-4 min-w-0">
-              <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
-                <span className="text-gray-400 dark:text-gray-500">尺寸</span>
-                <br />
-                <div className="mt-0.5 overflow-x-auto hide-scrollbar whitespace-nowrap mask-edge-r pr-2">
-                  <DetailParamValue task={task} paramKey="size" className="font-medium" actualParams={currentActualParams} />
+              {task.params.aspect_ratio && task.params.aspect_ratio !== 'custom' && (
+                <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
+                  <span className="text-gray-400 dark:text-gray-500">比例</span>
+                  <br />
+                  <div className="mt-0.5 overflow-x-auto hide-scrollbar whitespace-nowrap mask-edge-r pr-2">
+                    <DetailParamValue task={task} paramKey="aspect_ratio" className="font-medium" actualParams={currentActualParams} tooltip="图片实际值" />
+                  </div>
                 </div>
-              </div>
-              <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
-                <span className="text-gray-400 dark:text-gray-500">质量</span>
-                <br />
-                <div className="mt-0.5 overflow-x-auto hide-scrollbar whitespace-nowrap mask-edge-r pr-2">
-                  <DetailParamValue task={task} paramKey="quality" className="font-medium" actualParams={currentActualParams} />
+              )}
+              {task.params.resolution && (
+                <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
+                  <span className="text-gray-400 dark:text-gray-500">分辨率</span>
+                  <br />
+                  <div className="mt-0.5 overflow-x-auto hide-scrollbar whitespace-nowrap mask-edge-r pr-2">
+                    <DetailParamValue task={task} paramKey="resolution" className="font-medium" actualParams={currentActualParams} tooltip="图片实际值" />
+                  </div>
                 </div>
-              </div>
-              {task.params.complexity !== 'auto' && (
+              )}
+              {(!task.params.aspect_ratio || task.params.aspect_ratio === 'custom') && (
+                <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
+                  <span className="text-gray-400 dark:text-gray-500">尺寸</span>
+                  <br />
+                  <div className="mt-0.5 overflow-x-auto hide-scrollbar whitespace-nowrap mask-edge-r pr-2">
+                    <DetailParamValue task={task} paramKey="size" className="font-medium" actualParams={currentActualParams} tooltip="图片实际值" />
+                  </div>
+                </div>
+              )}
+              {showQualityCard && (
+                <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
+                  <span className="text-gray-400 dark:text-gray-500">质量</span>
+                  <br />
+                  <div className="mt-0.5 overflow-x-auto hide-scrollbar whitespace-nowrap mask-edge-r pr-2">
+                    <DetailParamValue task={task} paramKey="quality" className="font-medium" actualParams={currentActualParams} />
+                  </div>
+                </div>
+              )}
+              {modelFamily === 'gemini' && (task.paramSupport?.thinking ?? Boolean(task.params.thinking_level)) && (
+                <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
+                  <span className="text-gray-400 dark:text-gray-500">思考等级</span>
+                  <br />
+                  <div className="mt-0.5 overflow-x-auto hide-scrollbar whitespace-nowrap mask-edge-r pr-2">
+                    <span className="font-medium text-gray-700 dark:text-gray-300">{task.params.thinking_level ?? 'auto'}</span>
+                  </div>
+                </div>
+              )}
+              {modelFamily === 'gemini' && (task.params.google_search || task.params.image_search) && (
+                <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
+                  <span className="text-gray-400 dark:text-gray-500">搜索</span>
+                  <br />
+                  <div className="mt-0.5 font-medium text-gray-700 dark:text-gray-300">
+                    {[task.params.google_search ? 'Google Search' : null, task.params.image_search ? 'Image Search' : null].filter(Boolean).join(', ')}
+                  </div>
+                </div>
+              )}
+              {!modelFamily && (task.paramSupport?.complexity ?? task.params.complexity !== 'auto') && (
                 <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
                   <span className="text-gray-400 dark:text-gray-500">复杂度</span>
                   <br />
@@ -1004,19 +1051,28 @@ export default function DetailModal() {
                   </div>
                 </div>
               )}
-              <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
-                <span className="text-gray-400 dark:text-gray-500">格式</span>
-                <br />
-                <div className="mt-0.5 overflow-x-auto hide-scrollbar whitespace-nowrap mask-edge-r pr-2">
-                  <DetailParamValue task={task} paramKey="output_format" className="font-medium" actualParams={currentActualParams} />
-                </div>
-              </div>
-              {supportsTransparentOutput && (
+              {(!modelFamily || modelFamily === 'seedream') && (
                 <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
-                  <span className="text-gray-400 dark:text-gray-500">透明背景</span>
+                  <span className="text-gray-400 dark:text-gray-500">格式</span>
                   <br />
                   <div className="mt-0.5 overflow-x-auto hide-scrollbar whitespace-nowrap mask-edge-r pr-2">
-                    <span className="font-medium text-gray-700 dark:text-gray-300">{transparentOutputText}</span>
+                    <DetailParamValue task={task} paramKey="output_format" className="font-medium" actualParams={currentActualParams} />
+                  </div>
+                </div>
+              )}
+              {modelFamily === 'seedream' && (
+                <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
+                  <span className="text-gray-400 dark:text-gray-500">水印</span>
+                  <br />
+                  <span className="font-medium text-gray-700 dark:text-gray-300">{String(task.params.watermark ?? false)}</span>
+                </div>
+              )}
+              {(supportsTransparentOutput || modelFamily === 'seedream') && (
+                <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
+                  <span className="text-gray-400 dark:text-gray-500">{modelFamily === 'seedream' ? '背景' : '透明背景'}</span>
+                  <br />
+                  <div className="mt-0.5 overflow-x-auto hide-scrollbar whitespace-nowrap mask-edge-r pr-2">
+                    <span className="font-medium text-gray-700 dark:text-gray-300">{modelFamily === 'seedream' ? backgroundText : transparentOutputText}</span>
                     {currentTransparentOutputFailed && (
                       <span className="ml-1.5 rounded bg-red-50 px-1 py-0.5 text-[10px] font-medium uppercase leading-none text-red-600 dark:bg-red-500/10 dark:text-red-400">
                         failed
@@ -1025,7 +1081,7 @@ export default function DetailModal() {
                   </div>
                 </div>
               )}
-              {task.params.output_format === 'gif' && (
+              {!modelFamily && task.params.output_format === 'gif' && (
                 <>
                   <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
                     <span className="text-gray-400 dark:text-gray-500">帧数</span>
@@ -1043,7 +1099,7 @@ export default function DetailModal() {
                   </div>
                 </>
               )}
-              {(task.params.output_format === 'jpeg' || task.params.output_format === 'webp') && (
+              {!modelFamily && taskProvider !== 'fal' && (task.params.output_format === 'jpeg' || task.params.output_format === 'webp') && (
                 <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
                   <span className="text-gray-400 dark:text-gray-500">压缩率</span>
                   <br />
@@ -1052,13 +1108,15 @@ export default function DetailModal() {
                   </div>
                 </div>
               )}
-              <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
-                <span className="text-gray-400 dark:text-gray-500">审核</span>
-                <br />
-                <div className="mt-0.5 overflow-x-auto hide-scrollbar whitespace-nowrap mask-edge-r pr-2">
-                  <DetailParamValue task={task} paramKey="moderation" className="font-medium" actualParams={currentActualParams} />
+              {showModerationCard && (
+                <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
+                  <span className="text-gray-400 dark:text-gray-500">审核</span>
+                  <br />
+                  <div className="mt-0.5 overflow-x-auto hide-scrollbar whitespace-nowrap mask-edge-r pr-2">
+                    <DetailParamValue task={task} paramKey="moderation" className="font-medium" actualParams={currentActualParams} />
+                  </div>
                 </div>
-              </div>
+              )}
               {!isAgentTask && (
                 <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2 min-w-0 overflow-hidden">
                   <span className="text-gray-400 dark:text-gray-500">数量</span>
@@ -1069,6 +1127,8 @@ export default function DetailModal() {
                 </div>
               )}
             </div>
+
+            <ImageSearchSources grounding={task.searchGrounding} />
 
             {/* 时间 */}
             <div className={`text-xs text-gray-400 dark:text-gray-500 ${isTauri ? 'mb-2' : 'mb-4'}`}>
@@ -1096,23 +1156,33 @@ export default function DetailModal() {
             {/* 仅客户端：任务 ID 和图片 ID，可复制给使用命令行的 AI 工具，让它直接引用图片而不必重新上传 */}
             {isTauri && (
               <div className="mb-2 space-y-0.5 text-xs leading-5 text-gray-400 dark:text-gray-500">
-                {[['任务 ID', task.id], ['图片 ID', currentOutputImageId]].filter(([, id]) => id).map(([label, id]) => (
+                {[
+                  { label: '任务 ID', id: task.id, tooltip: copyTaskIdTooltip },
+                  { label: '图片 ID', id: currentOutputImageId, tooltip: copyImageIdTooltip },
+                ].filter((item) => item.id).map(({ label, id, tooltip }) => (
                   <div key={label} className="grid min-w-0 grid-cols-[3rem_minmax(0,1fr)_1.5rem] items-center gap-2">
                     <span>{label}</span>
                     <span data-selectable-text className="min-w-0 truncate font-mono">{id}</span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        copyTextToClipboard(id).then(
-                          () => showToast(`${label}已复制`, 'success'),
-                          (err) => showToast(getClipboardFailureMessage(`复制${label}失败`, err), 'error'),
-                        )
-                      }}
-                      aria-label={`复制${label}`}
-                      className="flex h-5 w-6 items-center justify-center rounded hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-white/[0.06] dark:hover:text-gray-300 transition-colors"
-                    >
-                      <CopyIcon className="h-3.5 w-3.5" />
-                    </button>
+                    <div className="relative">
+                      <button
+                        type="button"
+                        {...tooltip.handlers}
+                        onClick={() => {
+                          tooltip.handlers.onClick()
+                          copyTextToClipboard(id).then(
+                            () => showToast(`${label}已复制`, 'success'),
+                            (err) => showToast(getClipboardFailureMessage(`复制${label}失败`, err), 'error'),
+                          )
+                        }}
+                        aria-label={`复制${label}`}
+                        className="flex h-5 w-6 items-center justify-center rounded hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-white/[0.06] dark:hover:text-gray-300 transition-colors"
+                      >
+                        <CopyIcon className="h-3.5 w-3.5" />
+                      </button>
+                      <ViewportTooltip visible={tooltip.visible} className="whitespace-nowrap">
+                        复制{label}
+                      </ViewportTooltip>
+                    </div>
                   </div>
                 ))}
               </div>

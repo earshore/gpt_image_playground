@@ -15,12 +15,12 @@ export const ZIP_DOWNLOAD_ROUTE_VALUES = [
 ] as const
 export type ZipDownloadRoute = typeof ZIP_DOWNLOAD_ROUTE_VALUES[number]
 export const DEFAULT_ZIP_DOWNLOAD_ROUTES: ZipDownloadRoute[] = ['task-selection', 'favorite-collection-selection']
-export type BuiltInApiProvider = 'openai' | 'sb2api-async' | 'fal'
+export type BuiltInApiProvider = 'openai' | 'google' | 'xai' | 'bytedance' | 'sb2api-async' | 'fal'
 export type ApiProvider = BuiltInApiProvider | string
 export type CustomProviderTemplate = 'http-image'
 export const DEFAULT_STREAM_PARTIAL_IMAGES = 1
 export const DEFAULT_AGENT_MAX_TOOL_ROUNDS = 15
-/** 接口允许的参考图数量上限 */
+/** 未配置更低模型限制时的应用参考图数量上限 */
 export const MAX_INPUT_IMAGES = 16
 
 export type CustomProviderRequestMethod = 'GET' | 'POST'
@@ -44,6 +44,7 @@ export interface CustomProviderSubmitMapping {
   contentType?: CustomProviderContentType
   query?: Record<string, string>
   body?: Record<string, unknown>
+  omitValues?: Record<string, Array<string | number | boolean>>
   files?: CustomProviderFileMapping[]
   taskIdPath?: string
   result?: CustomProviderResultMapping
@@ -61,13 +62,28 @@ export interface CustomProviderPollMapping {
   result: CustomProviderResultMapping
 }
 
+export type CustomProviderImageSize = { mode: 'pixels' } | {
+  mode: 'aspect-ratio'
+  ratios: string[]
+  resolutions: string[]
+}
+
 export interface CustomProviderDefinition {
   id: string
   name: string
   template?: CustomProviderTemplate
+  imageSize?: CustomProviderImageSize
   submit: CustomProviderSubmitMapping
   editSubmit?: CustomProviderSubmitMapping
   poll?: CustomProviderPollMapping
+  /** 按顺序匹配模型 ID，支持 * 通配符；匹配后使用整套接口映射 */
+  modelOverrides?: Array<{
+    models: string[]
+    imageSize?: CustomProviderImageSize
+    submit: CustomProviderSubmitMapping
+    editSubmit?: CustomProviderSubmitMapping
+    poll?: CustomProviderPollMapping
+  }>
 }
 
 export interface ApiProfile {
@@ -84,6 +100,8 @@ export interface ApiProfile {
   model: string
   /** 首页选中的模型；不在列表中时回退到第一个 */
   selectedModel?: string
+  /** 在首页输入框的模型列表中展示此配置 */
+  showInModelList?: boolean
   imageGenerationModel?: string
   timeout: number
   apiMode: ApiMode
@@ -96,6 +114,7 @@ export interface ApiProfile {
   transparentBackgroundMethod: 'api' | 'local'
   /** 生成 SVG 时负责编写 SVG 的文本模型，留空使用默认值 */
   svgModel?: string
+  svgReasoningEffort?: ReasoningEffort
   providerDrafts?: Partial<Record<ApiProvider, Partial<Pick<ApiProfile, 'baseUrl' | 'model' | 'imageGenerationModel' | 'apiMode' | 'reasoningEffort' | 'codexCli' | 'apiProxy' | 'responseFormatB64Json' | 'streamImages' | 'streamPartialImages' | 'transparentBackgroundMethod'>>>>
 }
 
@@ -161,6 +180,7 @@ export interface AppSettings {
   saveTasksToActiveFavoriteCollection: boolean
   retryMode: RetryMode
   allowPromptRewrite: boolean
+  imagePromptHints: boolean
   taskCompletionNotification: boolean
   /** 启动时检查 GitHub 上的新版本 */
   autoCheckUpdate: boolean
@@ -208,6 +228,8 @@ export const GIF_FRAME_DURATION_RANGE = { min: 20, max: 2000 }
 
 /** 参数面板中不可选的项及原因，undefined 表示可选 */
 export interface ParamDisabledReasons {
+  outputFormat?: string
+  moderation?: string
   complexity?: string
   gif?: string
   svg?: string
@@ -218,6 +240,11 @@ export interface ParamDisabledReasons {
 
 export interface TaskParams {
   size: string
+  aspect_ratio?: string
+  resolution?: string
+  google_search?: boolean
+  image_search?: boolean
+  thinking_level?: 'auto' | 'minimal' | 'low' | 'medium' | 'high'
   quality: 'auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   /** auto 表示不发送，由模型使用默认值 */
   complexity: typeof IMAGE_COMPLEXITIES[number]
@@ -226,9 +253,22 @@ export interface TaskParams {
   moderation: 'auto' | 'low'
   n: number
   transparent_output: boolean
+  background?: 'auto' | 'transparent' | 'opaque'
+  watermark?: boolean
   /** 仅 GIF 输出 */
   frame_count: number
   frame_duration_ms: number
+}
+
+export interface ImageParameterControl {
+  type: 'string' | 'enum' | 'boolean' | 'integer'
+  visible: boolean
+  disabledReason?: string
+  options?: Array<{ label: string; value: string; disabledReason?: string }>
+  min?: number
+  max?: number
+  nullable?: boolean
+  hint?: string
 }
 
 export const DEFAULT_PARAMS: TaskParams = {
@@ -280,10 +320,20 @@ export interface AgentInputDraft {
 
 export type TaskStatus = 'running' | 'done' | 'error'
 
+export interface ImageSearchGrounding {
+  renderedContent?: string
+  sources: Array<{ uri: string; title: string; imageUri?: string; domain?: string }>
+}
+
 export interface TaskRecord {
+  searchGrounding?: ImageSearchGrounding[]
+  /** 请求中附加的图像生成和搜索提示词 */
+  promptHints?: { prefix: string; suffix: string }
   id: string
   prompt: string
   params: TaskParams
+  /** 请求配置支持的可选参数，用于展示默认值 */
+  paramSupport?: { thinking: boolean; complexity: boolean }
   /** 生成时使用的 Provider 类型 */
   apiProvider?: ApiProvider
   /** 生成时使用的 API 配置 ID */
@@ -384,6 +434,12 @@ export interface AgentMessage {
   maskImageId?: string | null
   outputTaskIds?: string[]
   createdAt: number
+}
+
+export type LightboxContext = { type: 'input' } | {
+  type: 'history'
+  maskTargetImageId?: string | null
+  maskImageId?: string | null
 }
 
 export interface AgentRound {
@@ -548,6 +604,7 @@ export interface FalImageFile {
 }
 
 export interface FalApiResponse {
+  grounding_metadata?: unknown[]
   images?: FalImageFile[]
   image?: FalImageFile | string
   url?: string

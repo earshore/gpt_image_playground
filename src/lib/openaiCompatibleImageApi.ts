@@ -1,4 +1,6 @@
+import { createSettingsForApiProfile, shouldReturnBase64 } from './apiProfiles'
 import { DEFAULT_STREAM_PARTIAL_IMAGES, type ApiProfile, type CustomProviderDefinition, type CustomProviderPollMapping, type CustomProviderResultMapping, type CustomProviderSubmitMapping, type ImageApiResponse, type ImageResponseItem, type ResponsesApiResponse, type ResponsesOutputItem, type TaskParams } from '../types'
+import { assertInputImageLimit } from './inputImageLimits'
 import { dataUrlToBlob, imageDataUrlToPngBlob, maskDataUrlToPngBlob } from './canvasImage'
 import { buildApiUrl, readClientDevProxyConfig, shouldUseApiProxy } from './devProxy'
 import {
@@ -18,6 +20,7 @@ import {
   isDataUrl,
   isHttpUrl,
   mergeActualParams,
+  callConcurrentImageRequests,
   maybeAppendTransparentBackgroundHint,
   maybeAppendImageToolDroppedHint,
   MIME_MAP,
@@ -25,10 +28,14 @@ import {
   pickActualParams,
   PROMPT_REWRITE_GUARD_PREFIX,
 } from './imageApiShared'
-import { getImageGenerationModel, isVectorOrAnimatedFormat } from './imageModels'
+import { getImageGenerationModel, getImageModelFamily, isVectorOrAnimatedFormat, usesGrokSizeParams } from './imageModels'
+import { getImageModelParams, getSeedreamSize } from './imageModelParams'
+import { OPENAI_IMAGE_TASK_PROVIDER, resolveCustomProviderModel } from './imageProviderMappings'
+import { getImageRequestExecution } from './imageRequestExecution'
 import { apiFetch, FetchConnectError } from './platform'
 import { isEventStreamResponse, readJsonServerSentEvents } from './serverSentEvents'
 import { prependCodexCliSizePrompt } from './size'
+import { getMaskDisabledReason, normalizeParamsForSettings } from './paramCompatibility'
 
 function getStreamPartialImages(profile: ApiProfile): number {
   return profile.streamPartialImages ?? DEFAULT_STREAM_PARTIAL_IMAGES
@@ -65,8 +72,12 @@ function getAllByPath(source: unknown, path: string | undefined): unknown[] {
 
   for (const key of parts) {
     const next: unknown[] = []
-    for (const item of current) {
+    for (let item of current) {
       if (item == null) continue
+      // 部分任务接口把结果对象编码成 JSON 字符串。
+      if (typeof item === 'string' && /^[\[{]/.test(item.trim())) {
+        try { item = JSON.parse(item) } catch { continue }
+      }
       if (key === '*') {
         if (Array.isArray(item)) next.push(...item)
         else if (typeof item === 'object') next.push(...Object.values(item as Record<string, unknown>))
@@ -105,10 +116,6 @@ function getStringValue(source: Record<string, unknown>, key: string): string | 
   return typeof value === 'string' && value.trim() ? value : undefined
 }
 
-function getErrorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
-}
-
 function getNumberValue(source: Record<string, unknown>, key: string): number | undefined {
   const value = source[key]
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
@@ -140,22 +147,20 @@ function createResponsesImageTool(
     type: 'image_generation',
     action: isEdit ? 'edit' : 'generate',
     output_format: params.output_format,
-    moderation: params.moderation,
   }
   const imageModel = getImageGenerationModel(profile)
   if (imageModel) tool.model = imageModel
 
   if (!profile.codexCli) {
     tool.size = params.size
+    tool.quality = params.quality
+    tool.moderation = params.moderation
   }
 
-  if (profile.streamImages) {
+  if (profile.streamImages && !isVectorOrAnimatedFormat(params.output_format)) {
     tool.partial_images = getStreamPartialImages(profile)
   }
 
-  if (!profile.codexCli) {
-    tool.quality = params.quality
-  }
   applyGptImage26Params(tool, params, profile)
 
   if (params.output_format !== 'png' && params.output_compression != null) {
@@ -439,53 +444,100 @@ async function parseResponsesApiStreamResponse(
 }
 
 export async function callOpenAICompatibleImageApi(opts: CallApiOptions, profile: ApiProfile, customProvider?: CustomProviderDefinition | null): Promise<CallApiResult> {
-  if (customProvider) {
-    const n = opts.params.n > 0 ? opts.params.n : 1
-    const submitMapping = opts.inputImageDataUrls.length > 0 && customProvider.editSubmit
-      ? customProvider.editSubmit
-      : customProvider.submit
-    const isAsync = Boolean(submitMapping.taskIdPath)
-    // SVG 每次请求只能生成一张
-    if ((profile.codexCli || opts.params.output_format === 'svg') && n > 1 && !isAsync) return callCustomHttpImageApiConcurrent(opts, profile, customProvider, n)
-    return callCustomHttpImageApi(opts, profile, customProvider)
+  assertInputImageLimit(profile, opts.inputImageDataUrls.length)
+  const family = getImageModelFamily(profile)
+  if (profile.codexCli && !family) {
+    const maskReason = getMaskDisabledReason(profile)
+    if (opts.maskDataUrl && maskReason) throw new Error(`${maskReason}，请使用参考图和提示词描述修改内容`)
+    opts = { ...opts, params: normalizeParamsForSettings(opts.params, createSettingsForApiProfile(opts.settings, profile)) }
   }
-
-  // SVG 和 GIF 不支持流式和中间图
-  const requestProfile = isVectorOrAnimatedFormat(opts.params.output_format) ? { ...profile, streamImages: false } : profile
-  return requestProfile.apiMode === 'responses'
-    ? callResponsesImageApi(opts, requestProfile)
-    : callImagesApi(opts, requestProfile)
+  if (family) {
+    if (opts.maskDataUrl) throw new Error('此模型不支持遮罩编辑，请使用参考图和提示词描述修改内容')
+    if (family !== 'seedream') opts = { ...opts, nativeTransparentBackground: false }
+  }
+  const execution = getImageRequestExecution(profile, opts.params, opts.inputImageDataUrls.length > 0, customProvider)
+  let callSingle: (options: CallApiOptions) => Promise<CallApiResult>
+  if (execution.customProvider) {
+    const provider = execution.customProvider
+    callSingle = (options) => callCustomHttpImageApi(options, profile, provider)
+  } else if (family) {
+    callSingle = (options) => callModelImagesApi(options, profile)
+  } else if (profile.apiMode === 'responses') {
+    // Responses 的 GIF 可流式返回生命周期事件，但不请求中间图。
+    const requestProfile = opts.params.output_format === 'svg' ? { ...profile, streamImages: false } : profile
+    callSingle = (options) => callResponsesImageApiSingle(options, requestProfile)
+  } else {
+    const requestProfile = isVectorOrAnimatedFormat(opts.params.output_format) ? { ...profile, streamImages: false } : profile
+    if (execution.concurrent && profile.codexCli) opts = { ...opts, params: { ...opts.params, quality: 'auto' } }
+    callSingle = (options) => callImagesApiSingle(options, requestProfile)
+  }
+  return execution.concurrent ? callConcurrentImageRequests(opts, callSingle) : callSingle(opts)
 }
 
-async function callImagesApi(opts: CallApiOptions, profile: ApiProfile): Promise<CallApiResult> {
-  const n = opts.params.n > 0 ? opts.params.n : 1
-  // SVG 每次请求只能生成一张
-  if ((profile.codexCli || profile.streamImages || opts.params.output_format === 'svg') && n > 1) {
-    return callImagesApiConcurrent(opts, profile, n)
+async function callModelImagesApi(opts: CallApiOptions, profile: ApiProfile): Promise<CallApiResult> {
+  const family = getImageModelFamily(profile)
+  const params = getImageModelParams(profile, opts.params)
+  const isEdit = opts.inputImageDataUrls.length > 0
+  const grokSizeParams = usesGrokSizeParams(profile)
+  const body: Record<string, unknown> = { model: profile.model, prompt: opts.prompt, n: opts.params.n > 0 ? opts.params.n : 1 }
+  if (family === 'seedream') {
+    if (profile.provider === 'bytedance') delete body.n
+    body.watermark = opts.params.watermark ?? false
+    body.size = getSeedreamSize(profile, opts.params)
+    body.background = opts.params.background === 'transparent' && profile.transparentBackgroundMethod === 'local' ? 'opaque' : opts.params.background ?? 'auto'
+    body.output_format = opts.params.output_format === 'jpeg' && body.background !== 'transparent' ? 'jpeg' : 'png'
+    if (isEdit) body.image = opts.inputImageDataUrls
+  } else if (family === 'gemini') {
+    body.size = params.aspect_ratio
+    body.resolution = params.resolution
+    if (isEdit) body.image_urls = opts.inputImageDataUrls
+  } else if (grokSizeParams) {
+    if (params.aspect_ratio !== 'auto') body.size = params.aspect_ratio
+    if (isEdit) {
+      const urls = opts.inputImageUrls?.filter(isHttpUrl) ?? []
+      if (urls.length !== opts.inputImageDataUrls.length) throw new Error('此模型只接受链接参考图，请通过图片链接添加参考图')
+      body.image_urls = urls
+    }
+  } else {
+    if (params.aspect_ratio !== 'auto') body.aspect_ratio = params.aspect_ratio
+    body.resolution = params.resolution?.toLowerCase()
+    if (params.quality !== undefined) body.quality = params.quality
+    const images = opts.inputImageDataUrls.map((url) => ({ type: 'image_url', url }))
+    if (images.length === 1) body.image = images[0]
+    if (images.length > 1) body.images = images
   }
-
-  return callImagesApiSingle(opts, profile)
-}
-
-async function callImagesApiConcurrent(opts: CallApiOptions, profile: ApiProfile, n: number): Promise<CallApiResult> {
-  const singleOpts = {
-    ...opts,
-    params: {
-      ...opts.params,
-      n: 1,
-      ...(profile.codexCli ? { quality: 'auto' as const } : {}),
-    },
+  if (shouldReturnBase64(profile)) body.response_format = 'b64_json'
+  assertImageInputPayloadSize(opts.inputImageDataUrls.reduce((sum, url) => sum + url.length, 0))
+  const proxyConfig = readClientDevProxyConfig()
+  const controller = new AbortController()
+  const abortFromCaller = () => controller.abort(opts.signal?.reason)
+  if (opts.signal?.aborted) abortFromCaller()
+  opts.signal?.addEventListener('abort', abortFromCaller, { once: true })
+  const timeoutId = setTimeout(() => controller.abort(createRequestTimeoutError(profile.timeout)), profile.timeout * 1000)
+  try {
+    const response = await apiFetch(buildApiUrl(profile.baseUrl, family === 'grok' && !grokSizeParams && isEdit ? 'images/edits' : 'images/generations', proxyConfig, profile.provider === 'openai' && shouldUseApiProxy(profile.apiProxy, proxyConfig), profile.provider === 'bytedance' ? 'v3' : 'v1'), {
+      method: 'POST',
+      headers: { ...createRequestHeaders(profile), 'Content-Type': 'application/json' },
+      cache: 'no-store',
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+    if (!response.ok) throw new Error(await getApiErrorMessage(response))
+    const payload = await response.json()
+    const taskId = getByPath(payload, 'data.0.task_id') ?? (getByPath(payload, 'data.object') === 'generation.task' ? getByPath(payload, 'data.id') : undefined)
+    if (typeof taskId === 'string' && taskId.trim()) {
+      clearTimeout(timeoutId)
+      opts.onCustomTaskEnqueued?.({ taskId })
+      return await pollCustomTaskResult(profile, OPENAI_IMAGE_TASK_PROVIDER.poll!, taskId, family === 'grok' ? 'image/jpeg' : 'image/png', controller.signal)
+    }
+    return await parseImagesApiResponse(payload, family === 'grok' || body.output_format === 'jpeg' ? 'image/jpeg' : 'image/png', controller.signal)
+  } catch (err) {
+    console.warn('图像请求失败', err)
+    throw err
+  } finally {
+    opts.signal?.removeEventListener('abort', abortFromCaller)
+    clearTimeout(timeoutId)
   }
-  const results = await Promise.allSettled(
-    Array.from({ length: n }).map((_, requestIndex) => callImagesApiSingle({
-      ...singleOpts,
-      onPartialImage: opts.onPartialImage
-        ? (partial) => opts.onPartialImage?.({ ...partial, requestIndex })
-        : undefined,
-    }, profile)),
-  )
-
-  return mergeConcurrentApiResults(results)
 }
 
 async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): Promise<CallApiResult> {
@@ -515,22 +567,25 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
       formData.append('prompt', prompt)
       if (!profile.codexCli) {
         formData.append('size', params.size)
+        formData.append('quality', params.quality)
+        formData.append('moderation', params.moderation)
       }
       formData.append('output_format', params.output_format)
-      formData.append('moderation', params.moderation)
       if (opts.nativeTransparentBackground) {
         formData.append('background', 'transparent')
       }
 
-      if (!profile.codexCli) {
-        formData.append('quality', params.quality)
-      }
-      // 与生成接口共用同一份 2.6 参数；编辑接口不支持 SVG，不会出现对象字段
       const gptImage26Params: Record<string, unknown> = {}
       applyGptImage26Params(gptImage26Params, params, profile)
-      for (const [key, value] of Object.entries(gptImage26Params)) {
-        if (typeof value !== 'object') formData.append(key, String(value))
+      // 表单只能传字符串，嵌套的 svg 字段展开为 svg[model]、svg[reasoning][effort]
+      const appendField = (key: string, value: unknown) => {
+        if (value && typeof value === 'object') {
+          for (const [name, item] of Object.entries(value)) appendField(`${key}[${name}]`, item)
+        } else {
+          formData.append(key, String(value))
+        }
       }
+      for (const [key, value] of Object.entries(gptImage26Params)) appendField(key, value)
 
       if (params.output_format !== 'png' && params.output_compression != null) {
         formData.append('output_compression', String(params.output_compression))
@@ -538,7 +593,7 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
       if (params.n > 1) {
         formData.append('n', String(params.n))
       }
-      if (profile.responseFormatB64Json) {
+      if (shouldReturnBase64(profile)) {
         formData.append('response_format', 'b64_json')
       }
       if (profile.streamImages) {
@@ -591,7 +646,6 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
         model: profile.model,
         prompt,
         output_format: params.output_format,
-        moderation: params.moderation,
       }
 
       if (opts.nativeTransparentBackground) {
@@ -600,10 +654,8 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
 
       if (!profile.codexCli) {
         body.size = params.size
-      }
-
-      if (!profile.codexCli) {
         body.quality = params.quality
+        body.moderation = params.moderation
       }
       applyGptImage26Params(body, params, profile)
 
@@ -613,7 +665,7 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
       if (params.n > 1) {
         body.n = params.n
       }
-      if (profile.responseFormatB64Json) {
+      if (shouldReturnBase64(profile)) {
         body.response_format = 'b64_json'
       }
       if (profile.streamImages) {
@@ -651,14 +703,18 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile): P
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
-      reject(new DOMException('Aborted', 'AbortError'))
+      reject(signal.reason)
       return
     }
-    const timer = setTimeout(resolve, ms)
-    signal.addEventListener('abort', () => {
+    const abort = () => {
       clearTimeout(timer)
-      reject(new DOMException('Aborted', 'AbortError'))
-    }, { once: true })
+      reject(signal.reason)
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', abort)
+      resolve()
+    }, ms)
+    signal.addEventListener('abort', abort, { once: true })
   })
 }
 
@@ -687,23 +743,24 @@ function buildTaskPath(path: string, taskId: string): string {
     .replace(/\{taskId\}/g, encodeURIComponent(taskId))
 }
 
-function resolveTemplateValue(value: unknown, context: Record<string, unknown>): unknown {
+function resolveTemplateValue(value: unknown, context: Record<string, unknown>, omitValues?: CustomProviderSubmitMapping['omitValues']): unknown {
   if (typeof value === 'string' && value.startsWith('$')) {
-    return getByPath(context, value.slice(1))
+    const resolved = getByPath(context, value.slice(1))
+    return omitValues?.[value]?.some((item) => item === resolved) ? undefined : resolved
   }
   if (Array.isArray(value)) {
-    return value.map((item) => resolveTemplateValue(item, context)).filter((item) => item !== undefined && item !== null)
+    return value.map((item) => resolveTemplateValue(item, context, omitValues)).filter((item) => item !== undefined && item !== null)
   }
   if (value && typeof value === 'object') {
     const entries = Object.entries(value as Record<string, unknown>)
-      .map(([key, item]) => [key, resolveTemplateValue(item, context)] as const)
+      .map(([key, item]) => [key, resolveTemplateValue(item, context, omitValues)] as const)
       .filter(([, item]) => item !== undefined && item !== null && (!Array.isArray(item) || item.length > 0))
     return Object.fromEntries(entries)
   }
   return value
 }
 
-function createCustomProviderContext(opts: CallApiOptions, profile: ApiProfile) {
+function createCustomProviderContext(opts: CallApiOptions, profile: ApiProfile, imageSize?: CustomProviderDefinition['imageSize']) {
   const sizePrompt = profile.codexCli && !opts.skipCodexCliSizePrompt
     ? prependCodexCliSizePrompt(opts.prompt, opts.params.size)
     : opts.prompt
@@ -715,6 +772,8 @@ function createCustomProviderContext(opts: CallApiOptions, profile: ApiProfile) 
   applyGptImage26Params(gptImage26Params, opts.params, profile)
   const params = {
     ...opts.params,
+    background: undefined,
+    watermark: undefined,
     complexity: undefined,
     frame_count: undefined,
     frame_duration_ms: undefined,
@@ -722,13 +781,29 @@ function createCustomProviderContext(opts: CallApiOptions, profile: ApiProfile) 
     ...(profile.codexCli ? { size: undefined, quality: undefined } : {}),
     ...(opts.nativeTransparentBackground ? { background: 'transparent' } : {}),
   }
+  const familyParams = getImageModelFamily(profile) ? getImageModelParams(profile, opts.params) : null
+  const modelParams = imageSize?.mode === 'pixels' ? null
+    : imageSize?.mode === 'aspect-ratio' ? getImageModelParams(profile, opts.params, imageSize) : familyParams
+  const seedreamParams = getImageModelFamily(profile) === 'seedream' ? {
+    watermark: opts.params.watermark ?? false,
+    background: opts.params.background === 'transparent' && profile.transparentBackgroundMethod === 'local' ? 'opaque' : opts.params.background ?? 'auto',
+    aspect_ratio: modelParams?.aspect_ratio === 'custom' ? undefined : modelParams?.aspect_ratio,
+    size: imageSize ? params.size : getSeedreamSize(profile, opts.params),
+    output_format: opts.params.output_format === 'jpeg' && opts.params.background !== 'transparent' ? 'jpeg' : 'png',
+    quality: undefined, moderation: undefined, output_compression: undefined,
+    google_search: undefined, image_search: undefined, thinking_level: undefined,
+  } : null
 
   const inputImageUrls = opts.inputImageUrls?.filter(isHttpUrl) ?? []
+  const requestParams = { ...params, ...(modelParams ? { ...modelParams, size: modelParams.aspect_ratio } : {}), ...(familyParams ? { quality: familyParams.quality } : {}), ...seedreamParams }
 
   return {
     profile,
     prompt,
-    params,
+    params: requestParams,
+    size: { pixels: typeof requestParams.size === 'string' && /^[1-9]\d*x[1-9]\d*$/.test(requestParams.size) ? requestParams.size : undefined },
+    mode: opts.inputImageDataUrls.length ? 'image-to-image' : 'text-to-image',
+    resolution: modelParams?.resolution ? { upper: modelParams.resolution, lower: modelParams.resolution.toLowerCase() } : undefined,
     inputImages: {
       dataUrls: opts.inputImageDataUrls.length ? opts.inputImageDataUrls : undefined,
       base64: opts.inputImageDataUrls.length ? opts.inputImageDataUrls.map((url) => url.replace(/^data:[^;]+;base64,/, '')) : undefined,
@@ -741,10 +816,10 @@ function createCustomProviderContext(opts: CallApiOptions, profile: ApiProfile) 
   }
 }
 
-function renderQuery(query: Record<string, string> | undefined, context: Record<string, unknown>): Record<string, string> | undefined {
+function renderQuery(query: Record<string, string> | undefined, context: Record<string, unknown>, omitValues?: CustomProviderSubmitMapping['omitValues']): Record<string, string> | undefined {
   if (!query) return undefined
   const entries = Object.entries(query)
-    .map(([key, value]) => [key, resolveTemplateValue(value, context)] as const)
+    .map(([key, value]) => [key, resolveTemplateValue(value, context, omitValues)] as const)
     .filter(([, value]) => value !== undefined && value !== null && String(value) !== '')
     .map(([key, value]) => [key, String(value)] as const)
   return entries.length ? Object.fromEntries(entries) : undefined
@@ -752,7 +827,7 @@ function renderQuery(query: Record<string, string> | undefined, context: Record<
 
 async function createCustomMultipartBody(mapping: CustomProviderSubmitMapping, opts: CallApiOptions, context: Record<string, unknown>): Promise<FormData> {
   const formData = new FormData()
-  const body = resolveTemplateValue(mapping.body ?? {}, context)
+  const body = resolveTemplateValue(mapping.body ?? {}, context, mapping.omitValues)
   if (body && typeof body === 'object' && !Array.isArray(body)) {
     for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
       if (value === undefined || value === null) continue
@@ -826,11 +901,11 @@ async function extractCustomImages(payload: unknown, result: CustomProviderResul
   return { images, ...(rawImageUrls.length ? { rawImageUrls } : {}) }
 }
 
-async function submitCustomRequest(mapping: CustomProviderSubmitMapping, opts: CallApiOptions, profile: ApiProfile, controller: AbortController, proxyConfig: ReturnType<typeof readClientDevProxyConfig>, useApiProxy: boolean): Promise<unknown> {
+async function submitCustomRequest(mapping: CustomProviderSubmitMapping, opts: CallApiOptions, profile: ApiProfile, controller: AbortController, proxyConfig: ReturnType<typeof readClientDevProxyConfig>, useApiProxy: boolean, imageSize?: CustomProviderDefinition['imageSize']): Promise<unknown> {
   const requestHeaders = createRequestHeaders(profile)
-  const context = createCustomProviderContext(opts, profile)
-  // 只用链接传参考图时，不能把其余参考图静默丢掉；同时用其他方式传参考图时链接只是补充
+  const context = createCustomProviderContext(opts, profile, imageSize)
   const template = JSON.stringify([mapping.body, mapping.query])
+  // 只用链接传参考图时，不能把其余参考图静默丢掉；同时用其他方式传参考图时链接只是补充
   const linkOnly = template.includes('$inputImages.urls')
     && !template.includes('$inputImages.dataUrls')
     && !template.includes('$inputImages.base64')
@@ -841,14 +916,14 @@ async function submitCustomRequest(mapping: CustomProviderSubmitMapping, opts: C
   }
   const method = mapping.method ?? 'POST'
   const contentType = mapping.contentType ?? 'json'
-  const path = appendQuery(mapping.path, renderQuery(mapping.query, context))
+  const path = appendQuery(mapping.path.replace(/\{model\}/g, encodeURIComponent(profile.model)), renderQuery(mapping.query, context, mapping.omitValues))
   const headers: Record<string, string> = { ...requestHeaders }
   let body: BodyInit | undefined
 
   if (method !== 'GET') {
     if (contentType === 'multipart') {
       const formData = await createCustomMultipartBody(mapping, opts, context)
-      if (profile.responseFormatB64Json) {
+      if (shouldReturnBase64(profile)) {
         formData.append('response_format', 'b64_json')
       }
       body = formData
@@ -858,8 +933,8 @@ async function submitCustomRequest(mapping: CustomProviderSubmitMapping, opts: C
           (opts.maskDataUrl ? getDataUrlEncodedByteSize(opts.maskDataUrl) : 0),
       )
       headers['Content-Type'] = 'application/json'
-      const resolved = resolveTemplateValue(mapping.body ?? {}, context)
-      if (profile.responseFormatB64Json && resolved && typeof resolved === 'object' && !Array.isArray(resolved)) {
+      const resolved = resolveTemplateValue(mapping.body ?? {}, context, mapping.omitValues)
+      if (shouldReturnBase64(profile) && resolved && typeof resolved === 'object' && !Array.isArray(resolved)) {
         (resolved as Record<string, unknown>).response_format = 'b64_json'
       }
       body = JSON.stringify(resolved)
@@ -893,6 +968,7 @@ async function pollCustomTaskResult(
   let isFirstPoll = true
 
   while (true) {
+    if (signal?.aborted) throw signal.reason
     if (isFirstPoll) {
       isFirstPoll = false
     } else if (signal) {
@@ -901,10 +977,11 @@ async function pollCustomTaskResult(
       await new Promise((resolve) => setTimeout(resolve, (poll.intervalSeconds ?? 5) * 1000))
     }
 
-    const taskPath = appendQuery(buildTaskPath(poll.path, taskId), poll.query)
+    const query = poll.query ? Object.fromEntries(Object.entries(poll.query).map(([key, value]) => [key, value.replace(/\{task_id\}|\{taskId\}/g, () => taskId).replace(/\{model\}/g, () => profile.model)])) : undefined
+    const taskPath = appendQuery(buildTaskPath(poll.path.replace(/\{model\}/g, encodeURIComponent(profile.model)), taskId), query)
     let taskPayload: unknown
     try {
-      const taskResponse = await apiFetch(buildApiUrl(profile.baseUrl, taskPath, proxyConfig, false), {
+      const taskResponse = await apiFetch(buildApiUrl(profile.baseUrl, taskPath, proxyConfig, profile.provider === 'openai' && shouldUseApiProxy(profile.apiProxy, proxyConfig)), {
         method: poll.method ?? 'GET',
         headers: requestHeaders,
         cache: 'no-store',
@@ -926,6 +1003,7 @@ async function pollCustomTaskResult(
       throw err
     }
 
+    if (signal?.aborted) throw signal.reason
     const state = getTaskState(taskPayload, poll)
     if (state === 'failure') {
       const message = getByPath(taskPayload, poll.errorPath) || getByPath(taskPayload, 'message') || getByPath(taskPayload, 'data.fail_reason') || getByPath(taskPayload, 'error.message')
@@ -948,10 +1026,12 @@ export async function getCustomQueuedImageResult(
   customProvider: CustomProviderDefinition,
   taskId: string,
   params: TaskParams,
+  signal?: AbortSignal,
 ): Promise<CallApiResult> {
+  customProvider = resolveCustomProviderModel(customProvider, profile.model)
   if (!customProvider.poll) throw new Error('自定义异步任务缺少 poll 配置')
   const mime = MIME_MAP[params.output_format] || 'image/png'
-  return pollCustomTaskResult(profile, customProvider.poll, taskId, mime)
+  return pollCustomTaskResult(profile, customProvider.poll, taskId, mime, signal)
 }
 
 async function callCustomHttpImageApi(opts: CallApiOptions, profile: ApiProfile, customProvider: CustomProviderDefinition): Promise<CallApiResult> {
@@ -959,6 +1039,9 @@ async function callCustomHttpImageApi(opts: CallApiOptions, profile: ApiProfile,
   const isEdit = inputImageDataUrls.length > 0
   const mime = MIME_MAP[params.output_format] || 'image/png'
   const controller = new AbortController()
+  const abortFromCaller = () => controller.abort(opts.signal?.reason)
+  if (opts.signal?.aborted) abortFromCaller()
+  opts.signal?.addEventListener('abort', abortFromCaller, { once: true })
   let timeoutId: ReturnType<typeof setTimeout> | null = setTimeout(() => controller.abort(createRequestTimeoutError(profile.timeout)), profile.timeout * 1000)
 
   try {
@@ -971,7 +1054,7 @@ async function callCustomHttpImageApi(opts: CallApiOptions, profile: ApiProfile,
     if (useApiProxy && (submitMapping.taskIdPath || customProvider.poll)) {
       throw new Error('API 代理暂不支持使用异步任务的自定义服务商。请关闭 API 代理，或改用同步返回图片的自定义服务商配置。')
     }
-    const submitPayload = await submitCustomRequest(submitMapping, opts, profile, controller, proxyConfig, useApiProxy)
+    const submitPayload = await submitCustomRequest(submitMapping, opts, profile, controller, proxyConfig, useApiProxy, customProvider.imageSize)
     const taskIdValue = submitMapping.taskIdPath ? getByPath(submitPayload, submitMapping.taskIdPath) : undefined
     const taskId = typeof taskIdValue === 'string' ? taskIdValue.trim() : String(taskIdValue ?? '').trim()
     if (submitMapping.taskIdPath && !taskId) {
@@ -981,75 +1064,16 @@ async function callCustomHttpImageApi(opts: CallApiOptions, profile: ApiProfile,
     }
     if (!taskId) return await extractCustomImages(submitPayload, submitMapping.result ?? {}, mime, controller.signal)
     if (!customProvider.poll) throw new Error('异步接口返回了 task_id，但服务商配置缺少 poll')
-    opts.onCustomTaskEnqueued?.({ taskId })
     if (timeoutId) {
       clearTimeout(timeoutId)
       timeoutId = null
     }
-    return pollCustomTaskResult(profile, customProvider.poll, taskId, mime, controller.signal)
+    opts.onCustomTaskEnqueued?.({ taskId })
+    return await pollCustomTaskResult(profile, customProvider.poll, taskId, mime, controller.signal)
   } finally {
+    opts.signal?.removeEventListener('abort', abortFromCaller)
     if (timeoutId) clearTimeout(timeoutId)
   }
-}
-
-function mergeConcurrentApiResults(results: PromiseSettledResult<CallApiResult>[]): CallApiResult {
-  const successfulResults = results
-    .filter((result): result is PromiseFulfilledResult<CallApiResult> => result.status === 'fulfilled')
-    .map((result) => result.value)
-  if (!successfulResults.length) {
-    const firstError = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')!
-    throw firstError.reason
-  }
-
-  const images = successfulResults.flatMap((result) => result.images)
-  const actualParamsList = successfulResults.flatMap((result) =>
-    result.actualParamsList?.length ? result.actualParamsList : result.images.map(() => result.actualParams),
-  )
-  const revisedPrompts = successfulResults.flatMap((result) =>
-    result.revisedPrompts?.length ? result.revisedPrompts : result.images.map(() => undefined),
-  )
-  const rawImageUrls = successfulResults.flatMap((result) => result.rawImageUrls ?? [])
-  const failedRequests = results.flatMap((result, requestIndex) =>
-    result.status === 'rejected' ? [{ requestIndex, error: getErrorMessage(result.reason) }] : [],
-  )
-
-  return {
-    images,
-    actualParams: mergeActualParams(successfulResults[0].actualParams ?? {}, { n: images.length }),
-    actualParamsList,
-    revisedPrompts,
-    ...(rawImageUrls.length ? { rawImageUrls } : {}),
-    ...(failedRequests.length ? { failedRequests } : {}),
-  }
-}
-
-async function callCustomHttpImageApiConcurrent(
-  opts: CallApiOptions,
-  profile: ApiProfile,
-  customProvider: CustomProviderDefinition,
-  n: number,
-): Promise<CallApiResult> {
-  const results = await Promise.allSettled(Array.from({ length: n }).map(() => callCustomHttpImageApi({
-    ...opts,
-    params: { ...opts.params, n: 1 },
-  }, profile, customProvider)))
-  return mergeConcurrentApiResults(results)
-}
-
-async function callResponsesImageApi(opts: CallApiOptions, profile: ApiProfile): Promise<CallApiResult> {
-  const n = opts.params.n > 0 ? opts.params.n : 1
-  if (n === 1) {
-    return callResponsesImageApiSingle(opts, profile)
-  }
-
-  const promises = Array.from({ length: n }).map((_, requestIndex) => callResponsesImageApiSingle({
-    ...opts,
-    onPartialImage: opts.onPartialImage
-      ? (partial) => opts.onPartialImage?.({ ...partial, requestIndex })
-      : undefined,
-  }, profile))
-  const results = await Promise.allSettled(promises)
-  return mergeConcurrentApiResults(results)
 }
 
 async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiProfile): Promise<CallApiResult> {
@@ -1078,7 +1102,7 @@ async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiPro
       model: profile.model,
       input: createResponsesInput(requestPrompt, inputImageDataUrls, opts.settings.allowPromptRewrite),
       tools: [createResponsesImageTool(params, inputImageDataUrls.length > 0, profile, opts.maskDataUrl, opts.nativeTransparentBackground)],
-      tool_choice: 'required',
+      tool_choice: profile.codexCli ? 'auto' : 'required',
     }
     if (profile.reasoningEffort) body.reasoning = { effort: profile.reasoningEffort }
     if (profile.streamImages) {

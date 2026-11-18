@@ -1,4 +1,4 @@
-import { OUTPUT_FORMATS, type ApiProfile, type AppSettings, type ResponsesOutputItem, type TaskParams } from '../types'
+import { OUTPUT_FORMATS, type ApiProfile, type AppSettings, type ImageSearchGrounding, type ResponsesOutputItem, type TaskParams, type TaskRecord } from '../types'
 import { blobToDataUrl } from './dataUrl'
 import { DEFAULT_SVG_MODEL } from './imageModels'
 import { apiFetch, isTauri } from './platform'
@@ -13,9 +13,16 @@ export const MIME_MAP: Record<string, string> = {
 
 /** GPT Image 2.6 的 complexity、SVG 和 GIF 字段；Images API 生成请求和 Responses 图像工具格式相同 */
 export function applyGptImage26Params(target: Record<string, unknown>, params: TaskParams, profile: ApiProfile) {
+  if (profile.codexCli && profile.provider !== 'fal') return
   if (params.complexity !== 'auto') target.complexity = params.complexity
   if (params.output_format === 'svg') {
-    target.svg = { model: profile.svgModel?.trim() || DEFAULT_SVG_MODEL }
+    const model = profile.svgModel?.trim() || (target.type === 'image_generation' ? undefined : DEFAULT_SVG_MODEL)
+    if (model || profile.svgReasoningEffort) {
+      target.svg = {
+        ...(model ? { model } : {}),
+        ...(profile.svgReasoningEffort ? { reasoning: { effort: profile.svgReasoningEffort } } : {}),
+      }
+    }
   }
   if (params.output_format === 'gif') {
     target.frame_count = params.frame_count
@@ -28,6 +35,7 @@ export const MAX_IMAGE_INPUT_PAYLOAD_BYTES = 512 * 1024 * 1024
 export const PROMPT_REWRITE_GUARD_PREFIX = 'Treat everything after this line as one complete image-generation prompt, including the resolution instruction. Follow it exactly without rewriting or omitting anything:'
 
 export interface CallApiOptions {
+  signal?: AbortSignal
   settings: AppSettings
   prompt: string
   params: TaskParams
@@ -40,12 +48,14 @@ export interface CallApiOptions {
   /** 第一张输入图上的透明标注层，仅 Images API 编辑接口原生支持 */
   markupDataUrl?: string
   skipCodexCliSizePrompt?: boolean
+  onPromptHintsPrepared?: (hints: TaskRecord['promptHints']) => void
   onFalRequestEnqueued?: (request: { requestId: string; endpoint: string }) => void
   onCustomTaskEnqueued?: (task: { taskId: string }) => void
   onPartialImage?: (partial: { image: string; partialImageIndex?: number; requestIndex?: number }) => void
 }
 
 export interface CallApiResult {
+  searchGrounding?: ImageSearchGrounding[]
   /** base64 data URL 列表 */
   images: string[]
   /** API 返回的实际生效参数 */
@@ -69,7 +79,9 @@ export function isDataUrl(value: unknown): value is string {
 }
 
 export function normalizeBase64Image(value: string, fallbackMime: string): string {
-  return value.startsWith('data:') ? value : `data:${fallbackMime};base64,${value}`
+  if (value.startsWith('data:')) return value
+  const mime = value.startsWith('/9j/') ? 'image/jpeg' : value.startsWith('iVBORw0KGgo') ? 'image/png' : value.startsWith('UklGR') ? 'image/webp' : fallbackMime
+  return `data:${mime};base64,${value}`
 }
 
 export function getResponsesImageResultBase64(result: ResponsesOutputItem['result']): string | undefined {
@@ -161,6 +173,7 @@ export function maybeAppendStreamingHint(message: string, status: number, stream
   const transparentMessage = maybeAppendTransparentBackgroundHint(message)
   if (transparentMessage !== message) return transparentMessage
   if (IMAGE_TOOL_DROPPED_ERROR.test(message)) return message
+  if (/hosted image_generation cannot be forced/i.test(message)) return message
   if (!streamImages) return message
   if (status === 401 || status === 403 || status === 404 || status === 408 || status === 429 || status >= 500) {
     return message
@@ -281,4 +294,48 @@ export function pickActualParams(source: unknown): Partial<TaskParams> {
 export function mergeActualParams(...sources: Array<Partial<TaskParams> | undefined>): Partial<TaskParams> | undefined {
   const merged = Object.assign({}, ...sources.filter((source) => source && Object.keys(source).length))
   return Object.keys(merged).length ? merged : undefined
+}
+
+function mergeConcurrentApiResults(results: PromiseSettledResult<CallApiResult>[]): CallApiResult {
+  const successfulResults = results
+    .filter((result): result is PromiseFulfilledResult<CallApiResult> => result.status === 'fulfilled')
+    .map((result) => result.value)
+  if (!successfulResults.length) {
+    const firstError = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')!
+    throw firstError.reason
+  }
+
+  const images = successfulResults.flatMap((result) => result.images)
+  const actualParamsList = successfulResults.flatMap((result) =>
+    result.actualParamsList?.length ? result.actualParamsList : result.images.map(() => result.actualParams),
+  )
+  const revisedPrompts = successfulResults.flatMap((result) =>
+    result.revisedPrompts?.length ? result.revisedPrompts : result.images.map(() => undefined),
+  )
+  const rawImageUrls = successfulResults.flatMap((result) => result.rawImageUrls ?? [])
+  const searchGrounding = successfulResults.flatMap((result) => result.searchGrounding ?? [])
+  const failedRequests = results.flatMap((result, requestIndex) =>
+    result.status === 'rejected' ? [{ requestIndex, error: result.reason instanceof Error ? result.reason.message : String(result.reason) }] : [],
+  )
+
+  return {
+    images,
+    actualParams: mergeActualParams(successfulResults[0].actualParams ?? {}, { n: images.length }),
+    actualParamsList,
+    revisedPrompts,
+    ...(rawImageUrls.length ? { rawImageUrls } : {}),
+    ...(searchGrounding.length ? { searchGrounding } : {}),
+    ...(failedRequests.length ? { failedRequests } : {}),
+  }
+}
+
+export async function callConcurrentImageRequests(opts: CallApiOptions, callSingle: (options: CallApiOptions) => Promise<CallApiResult>) {
+  const results = await Promise.allSettled(Array.from({ length: opts.params.n }, (_, requestIndex) => callSingle({
+    ...opts,
+    params: { ...opts.params, n: 1 },
+    onPartialImage: opts.onPartialImage
+      ? (partial) => opts.onPartialImage?.({ ...partial, requestIndex })
+      : undefined,
+  })))
+  return mergeConcurrentApiResults(results)
 }
