@@ -28,10 +28,32 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/CookSleep/gpt_image_playground.git
           git fetch --no-tags upstream main
+
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "Already up to date with upstream."
             exit 0
           fi
-          git merge upstream/main --no-edit \
-            -m "chore: sync upstream $(git rev-parse --short upstream/main)"
+
+          git merge --no-commit --no-ff upstream/main || true
+
+          # GITHUB_TOKEN has no permission to push workflow file changes
+          # (GitHub rejects it as "refusing to allow a GitHub App to create
+          # or update workflow ... without `workflows` permission"), so keep
+          # the fork's own CI definitions and ignore upstream's edits here.
+          git checkout HEAD -- .github/workflows 2>/dev/null || true
+
+          if [ -n "$(git ls-files -u)" ]; then
+            echo "::error::Unresolved merge conflicts outside .github/workflows; aborting."
+            git ls-files -u
+            git merge --abort || true
+            exit 1
+          fi
+
+          if git diff --cached --quiet; then
+            echo "Only workflow files changed upstream; nothing to sync."
+            git merge --abort || true
+            exit 0
+          fi
+
+          git commit -m "chore: sync upstream $(git rev-parse --short upstream/main)"
           git push origin HEAD:main
