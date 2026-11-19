@@ -2,7 +2,8 @@ name: Sync upstream
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    # 每天一次，北京时间 03:00（UTC 19:00），避开使用高峰
+    - cron: '0 19 * * *'
   workflow_dispatch:
 
 permissions:
@@ -22,6 +23,7 @@ jobs:
           fetch-depth: 0
 
       - name: Merge upstream main
+        id: merge
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -31,8 +33,12 @@ jobs:
 
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "Already up to date with upstream."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Merging upstream/main ($(git rev-parse --short upstream/main)) into main"
 
           git merge --no-commit --no-ff upstream/main || true
 
@@ -52,8 +58,34 @@ jobs:
           if git diff --cached --quiet; then
             echo "Only workflow files changed upstream; nothing to sync."
             git merge --abort || true
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          git commit -m "chore: sync upstream $(git rev-parse --short upstream/main)"
+          echo "=== staged changes ==="
+          git diff --cached --stat
+
+      - name: Set up Node
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      # Gate: build must pass here before anything reaches main.
+      # A broken upstream commit therefore never reaches production.
+      - name: Verify build before publishing
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run build
+          echo "Build verified - safe to publish"
+
+      - name: Push to main
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git commit -m "chore: sync upstream $(git -C . rev-parse --short upstream/main)"
           git push origin HEAD:main
+          echo "Pushed to main - Vercel production deploy will start"
