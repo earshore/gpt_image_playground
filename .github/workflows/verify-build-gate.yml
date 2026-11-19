@@ -1,0 +1,66 @@
+name: Verify build gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge mock upstream
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags origin mock-upstream
+
+          if git merge-base --is-ancestor origin/mock-upstream HEAD; then
+            echo "Already up to date."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          git merge --no-commit --no-ff origin/mock-upstream || true
+          git checkout HEAD -- .github/workflows 2>/dev/null || true
+
+          if [ -n "$(git ls-files -u)" ]; then
+            echo "::error::conflicts remain"; git ls-files -u; git merge --abort || true; exit 1
+          fi
+          if git diff --cached --quiet; then
+            echo "no content changes"; git merge --abort || true; echo "changed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "=== staged ==="
+          git diff --cached --stat
+
+      - name: Set up Node
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Verify build (production gate logic)
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run build
+          echo "BUILD-GATE-PASSED"
+
+      - name: Push to isolated branch
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git commit -m "test: verify build gate then publish"
+          git push origin HEAD:test/sync-full
+          echo "PUSH-OK"
